@@ -1,0 +1,57 @@
+name: Decrypt Domain Credentials
+description: Decrypts the RSA-encrypted domain admin password, masks it, and exports DOMAIN_USERNAME / DOMAIN_PASSWORD to the rest of the job.
+
+inputs:
+  encrypted_password:
+    description: Base64 RSA-encrypted domain admin password
+    required: true
+  username:
+    description: Domain admin username
+    required: true
+  private_key:
+    description: RSA private key (XML) from the Prod environment secret
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Decrypt Domain Password
+      shell: powershell
+      env:
+        ENC_PASSWORD: ${{ inputs.encrypted_password }}
+        PRIVATE_KEY: ${{ inputs.private_key }}
+        DOMAIN_USERNAME_IN: ${{ inputs.username }}
+
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        if ([string]::IsNullOrWhiteSpace($env:PRIVATE_KEY))        { throw "PRIVATE_KEY is empty - check the secret in the 'Prod' environment and that the job has environment: Prod" }
+        if ([string]::IsNullOrWhiteSpace($env:ENC_PASSWORD))       { throw "Encrypted password input is empty" }
+        if ([string]::IsNullOrWhiteSpace($env:DOMAIN_USERNAME_IN)) { throw "Domain username input is empty" }
+
+        $key = $env:PRIVATE_KEY.Trim()
+        if (-not ($key.StartsWith("<RSAKeyValue>") -and $key.EndsWith("</RSAKeyValue>"))) {
+            throw "PRIVATE_KEY is not valid RSA XML (must start with <RSAKeyValue> and end with </RSAKeyValue>)"
+        }
+
+        $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+        $rsa.FromXmlString($key)
+
+        try {
+            $cipher = [Convert]::FromBase64String($env:ENC_PASSWORD.Trim())
+            $plain  = [Text.Encoding]::UTF8.GetString($rsa.Decrypt($cipher, $true))
+        } catch {
+            throw "Decryption failed - wrong public key used, or the base64 was altered."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($plain)) { throw "Decrypted password is empty" }
+
+        # Mask FIRST, before anything else touches it
+        Write-Host "::add-mask::$plain"
+
+        # Export to the rest of THIS job only (UTF-8 without BOM)
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [IO.File]::AppendAllText($env:GITHUB_ENV, "DOMAIN_PASSWORD=$plain`n", $utf8)
+        [IO.File]::AppendAllText($env:GITHUB_ENV, "DOMAIN_USERNAME=$($env:DOMAIN_USERNAME_IN)`n", $utf8)
+
+        Write-Host "Domain credentials ready (password length: $($plain.Length))."
