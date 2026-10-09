@@ -76,8 +76,6 @@ jobs:
           $required = [ordered]@{
               ComputerName    = $ComputerName
               DomainName      = $DomainName
-              locu           = "tescoadmin"
-              locp           = "Tesco@1234567890"
               DSRM_PASSWORD   = $DsrmPassword
               DOMAIN_USERNAME = $DomainUsername
               DOMAIN_PASSWORD = $DomainPassword
@@ -95,7 +93,9 @@ jobs:
           # ==================================================
           # 4. CREATE LOCAL ADMIN CREDENTIAL
           # ==================================================
-
+          $locu = "tescoadmin"
+          $locp = "Tesco@1234567890"
+          
           $SecureLocalPassword = ConvertTo-SecureString `
               $locp `
               -AsPlainText `
