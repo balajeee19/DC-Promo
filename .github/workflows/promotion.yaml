@@ -34,7 +34,7 @@ jobs:
         id: dc-promotion
         shell: powershell
         env:
-          VMNAME: "NewADC02.testing.com"
+          VMNAME: "NewADC05.testing.com"
           DOMAINNAME: ${{ inputs.domain }}
           USERNAME: ${{ inputs.domainusername }}
           PASSWORD: ${{ inputs.domainpassword }}
@@ -114,9 +114,9 @@ jobs:
           # 5. AD DS PATHS
           # ==================================================
 
-          $DatabasePath = "D:\ADDB\NTDS"
-          $LogPath      = "D:\ADDB\NTDS"
-          $SysvolPath   = "D:\ADDB\SYSVOL"
+          $DatabasePath = "C:\ADDB\NTDS"
+          $LogPath      = "C:\ADDB\NTDS"
+          $SysvolPath   = "C:\ADDB\SYSVOL"
 
           Write-Host "=========================================="
           Write-Host "AD DS Configuration"
