@@ -1,0 +1,349 @@
+name: DC-Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target Domain'
+        required: true
+        type: string
+
+      domainusername:
+        description: 'Domain Admin Username'
+        required: true
+        type: string
+
+      domainpassword:
+        description: 'Domain Admin Password'
+        required: true
+        type: string
+
+      domaindsrm:
+        description: 'DSRM Password'
+        required: true
+        type: string
+
+jobs:
+
+  dc-promotion:
+    runs-on: self-hosted
+
+    steps:
+
+      - name: DC Promotion
+        id: dc-promotion
+        shell: powershell
+        env:
+          VMNAME: "NewADC01.testing.com"
+          DOMAINNAME: ${{ inputs.domain }}
+          USERNAME: ${{ inputs.domainusername }}
+          PASSWORD: ${{ inputs.domainpassword }}
+          DSRM: ${{ inputs.domaindsrm }}
+
+        run: |
+          # PowerShell code here
+
+          # ==================================================
+          # 1. BASIC VARIABLES
+          # ==================================================
+
+          $ComputerName = $env:VMNAME
+          $DomainName   = $env:DOMAINNAME
+          
+
+          Write-Host "=========================================="
+          Write-Host "Starting DC Promotion"
+          Write-Host "=========================================="
+          Write-Host "Hostname       : $ComputerName"
+          Write-Host "Selected Domain: $DomainName"
+          Write-Host "DataCentre     : $DCName"
+          Write-Host "=========================================="
+
+
+          # ==================================================
+          # 2. GET CREDENTIALS (never printed)
+          # ==================================================
+
+          $DsrmPassword   = $env:DSRM
+          $DomainUsername = $env:USERNAME
+          $DomainPassword = $env:PASSWORD
+
+
+          # ==================================================
+          # 3. VALIDATE REQUIRED VALUES (presence only)
+          # ==================================================
+
+          $required = [ordered]@{
+              ComputerName    = $ComputerName
+              DomainName      = $DomainName
+              ADMIN_USERNAME  = $locu
+              ADMIN_PASSWORD  = $locp
+              DSRM_PASSWORD   = $DsrmPassword
+              DOMAIN_USERNAME = $DomainUsername
+              DOMAIN_PASSWORD = $DomainPassword
+          }
+
+          foreach ($item in $required.GetEnumerator()) {
+              if ([string]::IsNullOrWhiteSpace($item.Value)) {
+                  throw "$($item.Key) is empty."
+              }
+          }
+
+          Write-Host "Required credentials received successfully."
+
+
+          # ==================================================
+          # 4. CREATE LOCAL ADMIN CREDENTIAL
+          # ==================================================
+
+          $SecureLocalPassword = ConvertTo-SecureString `
+              $locp `
+              -AsPlainText `
+              -Force
+
+          $LocalCredential = New-Object `
+              System.Management.Automation.PSCredential(
+                  $locu,
+                  $SecureLocalPassword
+              )
+
+          Write-Host "Local administrator credential created."
+
+
+          # ==================================================
+          # 5. AD DS PATHS
+          # ==================================================
+
+          $DatabasePath = "D:\ADDB\NTDS"
+          $LogPath      = "D:\ADDB\NTDS"
+          $SysvolPath   = "D:\ADDB\SYSVOL"
+
+          Write-Host "=========================================="
+          Write-Host "AD DS Configuration"
+          Write-Host "=========================================="
+          Write-Host "Domain        : $DomainName"
+          Write-Host "Database Path : $DatabasePath"
+          Write-Host "Log Path      : $LogPath"
+          Write-Host "SYSVOL Path   : $SysvolPath"
+          Write-Host "=========================================="
+
+
+          # ==================================================
+          # 6. CONNECT TO TARGET MEMBER SERVER
+          # ==================================================
+
+          try {
+
+              Write-Host "Connecting to target server: $ComputerName"
+
+              Invoke-Command `
+                  -ComputerName $ComputerName `
+                  -Credential $LocalCredential `
+                  -ErrorAction Stop `
+                  -ArgumentList @(
+                      $DomainUsername,
+                      $DomainPassword,
+                      $DsrmPassword,
+                      $DomainName,
+                      $DatabasePath,
+                      $LogPath,
+                      $SysvolPath
+                  ) `
+                  -ScriptBlock {
+
+                      param(
+                          [string]$RemoteDomainUsername,
+                          [string]$RemoteDomainPassword,
+                          [string]$RemoteDsrmPassword,
+                          [string]$RemoteDomainName,
+                          [string]$RemoteDatabasePath,
+                          [string]$RemoteLogPath,
+                          [string]$RemoteSysvolPath
+                      )
+
+                      # ======================================
+                      # REMOTE SERVER INFORMATION
+                      # ======================================
+
+                      Write-Host "=========================================="
+                      Write-Host "Running on target server"
+                      Write-Host "Computer: $env:COMPUTERNAME"
+                      Write-Host "=========================================="
+
+
+                      # ======================================
+                      # CHECK AD DS DEPLOYMENT MODULE
+                      # ======================================
+
+                      Write-Host "Checking ADDSDeployment module..."
+
+                      Import-Module ADDSDeployment -ErrorAction Stop
+
+                      Write-Host "ADDSDeployment module loaded successfully."
+
+
+                      # ======================================
+                      # DISCOVER REPLICATION SOURCE DC
+                      # ======================================
+
+                      Write-Host "=========================================="
+                      Write-Host "Discovering replication source DC..."
+                      Write-Host "=========================================="
+
+                      try {
+
+                          $DiscoveredDC = Get-ADDomainController `
+                              -Discover `
+                              -ForceDiscover `
+                              -ErrorAction Stop
+
+                      }
+                      catch {
+
+                          throw "Unable to discover a domain controller. Error: $($_.Exception.Message)"
+
+                      }
+
+
+                      # ======================================
+                      # EXTRACT DC INFORMATION
+                      # ======================================
+
+                      $ReplicationSourceDC = [string]$DiscoveredDC.HostName
+                      $SiteName            = [string]$DiscoveredDC.Site
+                      $DCIPAddress         = [string]$DiscoveredDC.IPv4Address
+
+                      if ([string]::IsNullOrWhiteSpace($ReplicationSourceDC)) {
+                          throw "DC discovery succeeded but HostName is empty."
+                      }
+
+                      if ([string]::IsNullOrWhiteSpace($SiteName)) {
+                          throw "DC discovery succeeded but Site is empty."
+                      }
+
+                      Write-Host "=========================================="
+                      Write-Host "Replication Source DC discovered"
+                      Write-Host "=========================================="
+                      Write-Host "Replication Source DC : $ReplicationSourceDC"
+                      Write-Host "Replication Source IP : $DCIPAddress"
+                      Write-Host "AD Site               : $SiteName"
+                      Write-Host "=========================================="
+
+
+                      # ======================================
+                      # CREATE DOMAIN CREDENTIAL
+                      # ======================================
+
+                      $RemoteSecureDomainPassword = ConvertTo-SecureString `
+                          $RemoteDomainPassword `
+                          -AsPlainText `
+                          -Force
+
+                      $RemoteDomainCredential = New-Object `
+                          System.Management.Automation.PSCredential(
+                              $RemoteDomainUsername,
+                              $RemoteSecureDomainPassword
+                          )
+
+
+                      # ======================================
+                      # CREATE DSRM SECURE PASSWORD
+                      # ======================================
+
+                      $RemoteSecureDsrmPassword = ConvertTo-SecureString `
+                          $RemoteDsrmPassword `
+                          -AsPlainText `
+                          -Force
+
+                      Write-Host "Credential objects created successfully."
+
+
+                      # ======================================
+                      # CREATE ADDS PARAMETERS
+                      # ======================================
+
+                      $RemoteADDSParams = @{
+
+                          DomainName                    = $RemoteDomainName
+                          Credential                    = $RemoteDomainCredential
+                          SafeModeAdministratorPassword = $RemoteSecureDsrmPassword
+                          DatabasePath                  = $RemoteDatabasePath
+                          LogPath                       = $RemoteLogPath
+                          SysvolPath                    = $RemoteSysvolPath
+                          SiteName                      = $SiteName
+                          ReplicationSourceDC           = $ReplicationSourceDC
+                          InstallDns                    = $false
+                          NoGlobalCatalog               = $false
+                          CriticalReplicationOnly       = $false
+                          NoRebootOnCompletion          = $true
+                          Force                         = $true
+                          Confirm                       = $false
+                      }
+
+
+                      # ======================================
+                      # DISPLAY NON-SENSITIVE PARAMETERS
+                      # ======================================
+
+                      Write-Host "=========================================="
+                      Write-Host "AD DS Promotion Parameters"
+                      Write-Host "=========================================="
+                      Write-Host "Domain              : $RemoteDomainName"
+                      Write-Host "Replication Source  : $ReplicationSourceDC"
+                      Write-Host "Site                : $SiteName"
+                      Write-Host "Database Path       : $RemoteDatabasePath"
+                      Write-Host "Log Path            : $RemoteLogPath"
+                      Write-Host "SYSVOL Path         : $RemoteSysvolPath"
+                      Write-Host "Install DNS         : $false"
+                      Write-Host "Global Catalog      : $true"
+                      Write-Host "No Reboot           : $true"
+                      Write-Host "=========================================="
+
+
+                      # ======================================
+                      # START DC PROMOTION
+                      # ======================================
+
+                      Write-Host "Starting Install-ADDSDomainController..."
+
+                      Install-ADDSDomainController `
+                          @RemoteADDSParams `
+                          -ErrorAction Stop
+
+                      Write-Host "=========================================="
+                      Write-Host "Install-ADDSDomainController completed."
+                      Write-Host "=========================================="
+
+                  }
+
+              # ==============================================
+              # SUCCESS
+              # ==============================================
+
+              Write-Host "=========================================="
+              Write-Host "DC Promotion command completed successfully."
+              Write-Host "=========================================="
+
+          }
+          catch {
+
+              # ==============================================
+              # FAILURE
+              # ==============================================
+
+              Write-Host "=========================================="
+              Write-Host "DC Promotion FAILED"
+              Write-Host "=========================================="
+
+              Write-Host "Error:"
+              Write-Host $_.Exception.Message
+
+              if ($_.Exception.InnerException) {
+                  Write-Host "Inner Exception:"
+                  Write-Host $_.Exception.InnerException.Message
+              }
+
+              Write-Host "=========================================="
+
+              throw
+          }
