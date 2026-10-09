@@ -56,7 +56,7 @@ jobs:
           Write-Host "=========================================="
           Write-Host "Hostname       : $ComputerName"
           Write-Host "Selected Domain: $DomainName"
-          Write-Host "DataCentre     : $DCName"
+          
           Write-Host "=========================================="
 
 
@@ -76,8 +76,8 @@ jobs:
           $required = [ordered]@{
               ComputerName    = $ComputerName
               DomainName      = $DomainName
-              ADMIN_USERNAME  = $locu
-              ADMIN_PASSWORD  = $locp
+              $locu           = "tescoadmin"
+              $locp           = "Tesco@1234567890"
               DSRM_PASSWORD   = $DsrmPassword
               DOMAIN_USERNAME = $DomainUsername
               DOMAIN_PASSWORD = $DomainPassword
