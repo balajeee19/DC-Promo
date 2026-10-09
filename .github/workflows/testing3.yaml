@@ -1,0 +1,762 @@
+name: testin3.yaml
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      domain:
+        description: "Domain Name"
+        required: true
+        type: choice
+        options:
+          - " "
+          - tgrc.tesco.org
+          - global.tesco.org
+          - dev.global.tesco.org
+
+      dataCentre:
+        description: "Data Centre"
+        required: true
+        type: choice
+        options:
+          - " "
+          - wdc
+          - cdc
+          - sitel
+
+      # NOTE: workflow_dispatch inputs are NOT secret. This is still plain text.
+      # Consider encrypting it the same way as the domain password.
+      apiToken:
+        description: "API Token"
+        required: true
+        type: string
+
+      domainusername:
+        description: 'Enter Domain Admin Username'
+        required: true
+        type: string
+
+      domainpassword_encrypted:
+        description: 'Domain Admin Password - ENCRYPTED (base64, never plain text)'
+        required: true
+        type: string
+
+
+jobs:
+
+  # ==========================================================
+  # JOB 1 - CREATE VM
+  # ==========================================================
+
+  Create-VM:
+
+    runs-on: self-hosted
+
+    outputs:
+      vmname: ${{ steps.createvm.outputs.vmname }}
+
+    steps:
+
+      - name: Create VM
+        id: createvm
+        shell: powershell
+
+        env:
+          API_TOKEN: ${{ inputs.apiToken }}
+          DOMAIN: ${{ inputs.domain }}
+          DATACENTRE: ${{ inputs.dataCentre }}
+
+        run: |
+
+          Write-Host "=========================================="
+          Write-Host "Creating VM"
+          Write-Host "=========================================="
+
+          Write-Host "Domain      : $env:DOMAIN"
+          Write-Host "Data Centre : $env:DATACENTRE"
+
+          .\scripts\Create-VM.ps1 `
+              -ApiToken "$env:API_TOKEN" `
+              -Domain "$env:DOMAIN" `
+              -DataCentre "$env:DATACENTRE"
+
+          Write-Host ""
+          Write-Host "Create VM step completed."
+
+
+  # ==========================================================
+  # JOB 2 - ADD ADMIN
+  # ==========================================================
+
+  Add-Admin:
+
+    needs: Create-VM
+
+    runs-on: self-hosted
+
+    environment: Prod
+
+    env:
+      ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add Service Account
+        shell: powershell
+        env:
+          VMNAME: ${{ needs.Create-VM.outputs.vmname }}
+
+        run: |
+
+          Write-Host "=========================================="
+          Write-Host "Adding Service Account"
+          Write-Host "=========================================="
+
+          Write-Host "Target VM: $env:VMNAME"
+
+          .\scripts\Add-ServiceAccount.ps1 `
+              -ComputerName "$env:VMNAME" `
+              -UserName "$env:ADMIN_USERNAME" `
+              -Password "$env:ADMIN_PASSWORD"
+
+
+  # ==========================================================
+  # JOB 3 - ADD DISKS
+  # ==========================================================
+
+  Add-Disks:
+
+    needs:
+      - Create-VM
+      - Add-Admin
+
+    runs-on: self-hosted
+
+    environment: Prod
+
+    env:
+      ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Additional Disk
+        shell: powershell
+        env:
+          VMNAME: ${{ needs.Create-VM.outputs.vmname }}
+
+        run: |
+
+          Write-Host "=========================================="
+          Write-Host "Configuring Additional Disks"
+          Write-Host "=========================================="
+
+          .\scripts\Add-Disk.ps1 `
+              -ComputerName "$env:VMNAME" `
+              -UserName "$env:ADMIN_USERNAME" `
+              -Password "$env:ADMIN_PASSWORD"
+
+
+  # ==========================================================
+  # JOB 4 - INSTALL ADDS
+  # ==========================================================
+
+  Install-ADDS:
+
+    needs:
+      - Create-VM
+      - Add-Admin
+      - Add-Disks
+
+    runs-on: self-hosted
+
+    environment: Prod
+
+    env:
+      ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Installing ADDS Roles and Features
+        shell: powershell
+        env:
+          VMNAME: ${{ needs.Create-VM.outputs.vmname }}
+
+        run: |
+
+          Write-Host "=========================================="
+          Write-Host "Installing ADDS Roles and Features..."
+          Write-Host "=========================================="
+
+          Write-Host "Target VM: $env:VMNAME"
+
+          .\scripts\InstallADDS.ps1 `
+              -ComputerName "$env:VMNAME" `
+              -UserName "$env:ADMIN_USERNAME" `
+              -Password "$env:ADMIN_PASSWORD"
+
+      - name: Continue AD configuration
+        shell: powershell
+        env:
+          VMNAME: ${{ needs.Create-VM.outputs.vmname }}
+
+        run: |
+
+          Write-Host "=========================================="
+          Write-Host "Continue AD Configuration"
+          Write-Host "=========================================="
+
+          Write-Host "Target VM: $env:VMNAME"
+
+          .\scripts\Continue-ADDS.ps1 `
+              -ComputerName "$env:VMNAME" `
+              -UserName "$env:ADMIN_USERNAME" `
+              -Password "$env:ADMIN_PASSWORD"
+
+
+  # ==========================================================
+  # JOB 5 - DC PROMOTION
+  #
+  # Decrypts the domain password and reads the DSRM password
+  # from Vault INSIDE this job. No secret crosses a job
+  # boundary (no job outputs, no GITHUB_OUTPUT).
+  # ==========================================================
+
+  DC-Promotion:
+
+    runs-on: self-hosted
+
+    needs:
+      - Create-VM
+      - Add-Admin
+      - Add-Disks
+      - Install-ADDS
+
+    environment: Prod
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+      VAULT_ADDR: https://vault.tpc.tesco.org
+      VAULT_NAMESPACE: 086platformwindows1
+      VAULT_JWT_ROLE: test_role
+      VAULT_JWT_PATH: jwt
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ======================================================
+      # STEP A - DECRYPT DOMAIN PASSWORD (user input)
+      # ======================================================
+      - name: Decrypt Domain Password
+        shell: powershell
+        env:
+          ENC_PASSWORD: ${{ inputs.domainpassword_encrypted }}
+          PRIVATE_KEY: ${{ secrets.DOMAIN_INPUT_PRIVATE_KEY }}
+          DOMAIN_USERNAME_IN: ${{ inputs.domainusername }}
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:PRIVATE_KEY))        { throw "PRIVATE_KEY is empty - check the secret in the 'Prod' environment" }
+          if ([string]::IsNullOrWhiteSpace($env:ENC_PASSWORD))       { throw "Encrypted password input is empty" }
+          if ([string]::IsNullOrWhiteSpace($env:DOMAIN_USERNAME_IN)) { throw "Domain username input is empty" }
+
+          $key = $env:PRIVATE_KEY.Trim()
+          if (-not ($key.StartsWith("<RSAKeyValue>") -and $key.EndsWith("</RSAKeyValue>"))) {
+              throw "PRIVATE_KEY is not valid RSA XML (must start with <RSAKeyValue> and end with </RSAKeyValue>)"
+          }
+
+          $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+          $rsa.FromXmlString($key)
+
+          try {
+              $cipher = [Convert]::FromBase64String($env:ENC_PASSWORD.Trim())
+              $plain  = [Text.Encoding]::UTF8.GetString($rsa.Decrypt($cipher, $true))
+          } catch {
+              throw "Decryption failed - wrong public key used, or the base64 was altered."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($plain)) { throw "Decrypted password is empty" }
+
+          # Mask FIRST, before anything else touches it
+          Write-Host "::add-mask::$plain"
+
+          # Write to GITHUB_ENV as UTF-8 without BOM (available to later steps in this job only)
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "DOMAIN_PASSWORD=$plain`n", $utf8)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "DOMAIN_USERNAME=$($env:DOMAIN_USERNAME_IN)`n", $utf8)
+
+          Write-Host "Domain credentials received (password length: $($plain.Length))."
+
+      # ======================================================
+      # STEP B - READ DSRM PASSWORD FROM VAULT
+      # ======================================================
+      - name: Read DSRM Password from Vault
+        shell: powershell
+
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # --------------------------------------------------
+          # 1. Check GitHub OIDC environment variables
+          # --------------------------------------------------
+          if ([string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {
+              throw "ACTIONS_ID_TOKEN_REQUEST_TOKEN is not available."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_URL)) {
+              throw "ACTIONS_ID_TOKEN_REQUEST_URL is not available."
+          }
+
+          # --------------------------------------------------
+          # 2. Request GitHub OIDC JWT
+          # --------------------------------------------------
+          $oidcUri     = "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://github.dev.global.tesco.org/Infra-cloudOps"
+          $OidcHeaders = @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }
+
+          try {
+              $OidcResponse = Invoke-RestMethod `
+                  -Uri $oidcUri `
+                  -Headers $OidcHeaders `
+                  -Method Get `
+                  -UseBasicParsing `
+                  -ErrorAction Stop
+          }
+          catch {
+              Write-Host "OIDC REQUEST FAILED"
+              Write-Host $_.Exception.GetType().FullName
+              Write-Host $_.Exception.Message
+              throw
+          }
+
+          $Jwt = $OidcResponse.value
+          if ([string]::IsNullOrWhiteSpace($Jwt)) { throw "GitHub OIDC endpoint responded but JWT was empty." }
+          Write-Host "::add-mask::$Jwt"
+          Write-Host "GitHub OIDC JWT received successfully."
+
+          # --------------------------------------------------
+          # 2b. Print non-secret claims and fail fast if this
+          #     job is not running under the Prod environment.
+          #     (The JWT payload is not a secret. Remove once stable.)
+          # --------------------------------------------------
+          $payload = $Jwt.Split('.')[1].Replace('-','+').Replace('_','/')
+          switch ($payload.Length % 4) { 2 { $payload += '==' } 3 { $payload += '=' } }
+          $claims = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+
+          Write-Host "sub        : $($claims.sub)"
+          Write-Host "aud        : $($claims.aud)"
+          Write-Host "environment: $($claims.environment)"
+          Write-Host "repository : $($claims.repository)"
+
+          if ($claims.environment -ne "Prod") {
+              throw "This job is not running under environment 'Prod' (got '$($claims.environment)'). Make sure the new workflow file is pushed to the branch you dispatch from, and start a NEW run."
+          }
+
+          # --------------------------------------------------
+          # 3. Vault login
+          # --------------------------------------------------
+          $LoginUri  = "$env:VAULT_ADDR/v1/auth/$env:VAULT_JWT_PATH/login"
+          $LoginBody = @{ role = $env:VAULT_JWT_ROLE; jwt = $Jwt } | ConvertTo-Json
+
+          $VaultHeaders = @{
+              "X-Vault-Namespace" = $env:VAULT_NAMESPACE
+              "Content-Type"      = "application/json"
+          }
+
+          try {
+              $LoginResponse = Invoke-RestMethod `
+                  -Uri $LoginUri `
+                  -Method Post `
+                  -Headers $VaultHeaders `
+                  -Body $LoginBody `
+                  -UseBasicParsing `
+                  -ErrorAction Stop
+          }
+          catch {
+              Write-Host "VAULT AUTHENTICATION FAILED"
+              Write-Host $_.Exception.GetType().FullName
+              Write-Host $_.Exception.Message
+              throw
+          }
+
+          $VaultToken = $LoginResponse.auth.client_token
+          if ([string]::IsNullOrWhiteSpace($VaultToken)) { throw "Vault authentication succeeded but no client token was returned." }
+          Write-Host "::add-mask::$VaultToken"
+          Write-Host "Vault authentication successful."
+
+          # --------------------------------------------------
+          # 4. Read secret from Vault
+          # --------------------------------------------------
+          $SecretUri = "$env:VAULT_ADDR/v1/kv-testing/data/addc"
+
+          $SecretHeaders = @{
+              "X-Vault-Namespace" = $env:VAULT_NAMESPACE
+              "X-Vault-Token"     = $VaultToken
+          }
+
+          try {
+              $SecretResponse = Invoke-RestMethod `
+                  -Uri $SecretUri `
+                  -Method Get `
+                  -Headers $SecretHeaders `
+                  -UseBasicParsing `
+                  -ErrorAction Stop
+          }
+          catch {
+              Write-Host "VAULT SECRET READ FAILED"
+              Write-Host $_.Exception.GetType().FullName
+              Write-Host $_.Exception.Message
+              throw
+          }
+
+          # 'ps' = DSRM password, 'us' = username value (not used for promotion)
+          $dsrm = $SecretResponse.data.data.ps
+          if ([string]::IsNullOrWhiteSpace($dsrm)) { throw "Vault returned empty 'ps' secret." }
+
+          Write-Host "::add-mask::$dsrm"
+
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "DSRM_PASSWORD=$dsrm`n", $utf8)
+
+          Write-Host "DSRM password retrieved from Vault."
+
+      # ======================================================
+      # STEP C - DC PROMOTION
+      # ======================================================
+      - name: DC Promotion
+        id: dc-promotion
+        shell: powershell
+
+        env:
+          VMNAME: ${{ needs.Create-VM.outputs.vmname }}
+          DOMAINNAME: ${{ inputs.domain }}
+          DATACENTRE: ${{ inputs.dataCentre }}
+
+        run: |
+
+          # ==================================================
+          # 1. BASIC VARIABLES
+          # ==================================================
+
+          $ComputerName = $env:VMNAME
+          $DomainName   = $env:DOMAINNAME
+          $DCName       = $env:DATACENTRE
+
+          Write-Host "=========================================="
+          Write-Host "Starting DC Promotion"
+          Write-Host "=========================================="
+          Write-Host "Hostname       : $ComputerName"
+          Write-Host "Selected Domain: $DomainName"
+          Write-Host "DataCentre     : $DCName"
+          Write-Host "=========================================="
+
+
+          # ==================================================
+          # 2. GET CREDENTIALS (never printed)
+          # ==================================================
+
+          $locu           = $env:ADMIN_USERNAME
+          $locp           = $env:ADMIN_PASSWORD
+          $DsrmPassword   = $env:DSRM_PASSWORD
+          $DomainUsername = $env:DOMAIN_USERNAME
+          $DomainPassword = $env:DOMAIN_PASSWORD
+
+
+          # ==================================================
+          # 3. VALIDATE REQUIRED VALUES (presence only)
+          # ==================================================
+
+          $required = [ordered]@{
+              ComputerName    = $ComputerName
+              DomainName      = $DomainName
+              ADMIN_USERNAME  = $locu
+              ADMIN_PASSWORD  = $locp
+              DSRM_PASSWORD   = $DsrmPassword
+              DOMAIN_USERNAME = $DomainUsername
+              DOMAIN_PASSWORD = $DomainPassword
+          }
+
+          foreach ($item in $required.GetEnumerator()) {
+              if ([string]::IsNullOrWhiteSpace($item.Value)) {
+                  throw "$($item.Key) is empty."
+              }
+          }
+
+          Write-Host "Required credentials received successfully."
+
+
+          # ==================================================
+          # 4. CREATE LOCAL ADMIN CREDENTIAL
+          # ==================================================
+
+          $SecureLocalPassword = ConvertTo-SecureString `
+              $locp `
+              -AsPlainText `
+              -Force
+
+          $LocalCredential = New-Object `
+              System.Management.Automation.PSCredential(
+                  $locu,
+                  $SecureLocalPassword
+              )
+
+          Write-Host "Local administrator credential created."
+
+
+          # ==================================================
+          # 5. AD DS PATHS
+          # ==================================================
+
+          $DatabasePath = "D:\ADDB\NTDS"
+          $LogPath      = "D:\ADDB\NTDS"
+          $SysvolPath   = "D:\ADDB\SYSVOL"
+
+          Write-Host "=========================================="
+          Write-Host "AD DS Configuration"
+          Write-Host "=========================================="
+          Write-Host "Domain        : $DomainName"
+          Write-Host "Database Path : $DatabasePath"
+          Write-Host "Log Path      : $LogPath"
+          Write-Host "SYSVOL Path   : $SysvolPath"
+          Write-Host "=========================================="
+
+
+          # ==================================================
+          # 6. CONNECT TO TARGET MEMBER SERVER
+          # ==================================================
+
+          try {
+
+              Write-Host "Connecting to target server: $ComputerName"
+
+              Invoke-Command `
+                  -ComputerName $ComputerName `
+                  -Credential $LocalCredential `
+                  -ErrorAction Stop `
+                  -ArgumentList @(
+                      $DomainUsername,
+                      $DomainPassword,
+                      $DsrmPassword,
+                      $DomainName,
+                      $DatabasePath,
+                      $LogPath,
+                      $SysvolPath
+                  ) `
+                  -ScriptBlock {
+
+                      param(
+                          [string]$RemoteDomainUsername,
+                          [string]$RemoteDomainPassword,
+                          [string]$RemoteDsrmPassword,
+                          [string]$RemoteDomainName,
+                          [string]$RemoteDatabasePath,
+                          [string]$RemoteLogPath,
+                          [string]$RemoteSysvolPath
+                      )
+
+                      # ======================================
+                      # REMOTE SERVER INFORMATION
+                      # ======================================
+
+                      Write-Host "=========================================="
+                      Write-Host "Running on target server"
+                      Write-Host "Computer: $env:COMPUTERNAME"
+                      Write-Host "=========================================="
+
+
+                      # ======================================
+                      # CHECK AD DS DEPLOYMENT MODULE
+                      # ======================================
+
+                      Write-Host "Checking ADDSDeployment module..."
+
+                      Import-Module ADDSDeployment -ErrorAction Stop
+
+                      Write-Host "ADDSDeployment module loaded successfully."
+
+
+                      # ======================================
+                      # DISCOVER REPLICATION SOURCE DC
+                      # ======================================
+
+                      Write-Host "=========================================="
+                      Write-Host "Discovering replication source DC..."
+                      Write-Host "=========================================="
+
+                      try {
+
+                          $DiscoveredDC = Get-ADDomainController `
+                              -Discover `
+                              -ForceDiscover `
+                              -ErrorAction Stop
+
+                      }
+                      catch {
+
+                          throw "Unable to discover a domain controller. Error: $($_.Exception.Message)"
+
+                      }
+
+
+                      # ======================================
+                      # EXTRACT DC INFORMATION
+                      # ======================================
+
+                      $ReplicationSourceDC = [string]$DiscoveredDC.HostName
+                      $SiteName            = [string]$DiscoveredDC.Site
+                      $DCIPAddress         = [string]$DiscoveredDC.IPv4Address
+
+                      if ([string]::IsNullOrWhiteSpace($ReplicationSourceDC)) {
+                          throw "DC discovery succeeded but HostName is empty."
+                      }
+
+                      if ([string]::IsNullOrWhiteSpace($SiteName)) {
+                          throw "DC discovery succeeded but Site is empty."
+                      }
+
+                      Write-Host "=========================================="
+                      Write-Host "Replication Source DC discovered"
+                      Write-Host "=========================================="
+                      Write-Host "Replication Source DC : $ReplicationSourceDC"
+                      Write-Host "Replication Source IP : $DCIPAddress"
+                      Write-Host "AD Site               : $SiteName"
+                      Write-Host "=========================================="
+
+
+                      # ======================================
+                      # CREATE DOMAIN CREDENTIAL
+                      # ======================================
+
+                      $RemoteSecureDomainPassword = ConvertTo-SecureString `
+                          $RemoteDomainPassword `
+                          -AsPlainText `
+                          -Force
+
+                      $RemoteDomainCredential = New-Object `
+                          System.Management.Automation.PSCredential(
+                              $RemoteDomainUsername,
+                              $RemoteSecureDomainPassword
+                          )
+
+
+                      # ======================================
+                      # CREATE DSRM SECURE PASSWORD
+                      # ======================================
+
+                      $RemoteSecureDsrmPassword = ConvertTo-SecureString `
+                          $RemoteDsrmPassword `
+                          -AsPlainText `
+                          -Force
+
+                      Write-Host "Credential objects created successfully."
+
+
+                      # ======================================
+                      # CREATE ADDS PARAMETERS
+                      # ======================================
+
+                      $RemoteADDSParams = @{
+
+                          DomainName                    = $RemoteDomainName
+                          Credential                    = $RemoteDomainCredential
+                          SafeModeAdministratorPassword = $RemoteSecureDsrmPassword
+                          DatabasePath                  = $RemoteDatabasePath
+                          LogPath                       = $RemoteLogPath
+                          SysvolPath                    = $RemoteSysvolPath
+                          SiteName                      = $SiteName
+                          ReplicationSourceDC           = $ReplicationSourceDC
+                          InstallDns                    = $false
+                          NoGlobalCatalog               = $false
+                          CriticalReplicationOnly       = $false
+                          NoRebootOnCompletion          = $true
+                          Force                         = $true
+                          Confirm                       = $false
+                      }
+
+
+                      # ======================================
+                      # DISPLAY NON-SENSITIVE PARAMETERS
+                      # ======================================
+
+                      Write-Host "=========================================="
+                      Write-Host "AD DS Promotion Parameters"
+                      Write-Host "=========================================="
+                      Write-Host "Domain              : $RemoteDomainName"
+                      Write-Host "Replication Source  : $ReplicationSourceDC"
+                      Write-Host "Site                : $SiteName"
+                      Write-Host "Database Path       : $RemoteDatabasePath"
+                      Write-Host "Log Path            : $RemoteLogPath"
+                      Write-Host "SYSVOL Path         : $RemoteSysvolPath"
+                      Write-Host "Install DNS         : $false"
+                      Write-Host "Global Catalog      : $true"
+                      Write-Host "No Reboot           : $true"
+                      Write-Host "=========================================="
+
+
+                      # ======================================
+                      # START DC PROMOTION
+                      # ======================================
+
+                      Write-Host "Starting Install-ADDSDomainController..."
+
+                      Install-ADDSDomainController `
+                          @RemoteADDSParams `
+                          -ErrorAction Stop
+
+                      Write-Host "=========================================="
+                      Write-Host "Install-ADDSDomainController completed."
+                      Write-Host "=========================================="
+
+                  }
+
+              # ==============================================
+              # SUCCESS
+              # ==============================================
+
+              Write-Host "=========================================="
+              Write-Host "DC Promotion command completed successfully."
+              Write-Host "=========================================="
+
+          }
+          catch {
+
+              # ==============================================
+              # FAILURE
+              # ==============================================
+
+              Write-Host "=========================================="
+              Write-Host "DC Promotion FAILED"
+              Write-Host "=========================================="
+
+              Write-Host "Error:"
+              Write-Host $_.Exception.Message
+
+              if ($_.Exception.InnerException) {
+                  Write-Host "Inner Exception:"
+                  Write-Host $_.Exception.InnerException.Message
+              }
+
+              Write-Host "=========================================="
+
+              throw
+          }
+
+
+ 
