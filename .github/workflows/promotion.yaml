@@ -34,7 +34,7 @@ jobs:
         id: dc-promotion
         shell: powershell
         env:
-          VMNAME: "NewADC01.testing.com"
+          VMNAME: "NewADC02.testing.com"
           DOMAINNAME: ${{ inputs.domain }}
           USERNAME: ${{ inputs.domainusername }}
           PASSWORD: ${{ inputs.domainpassword }}
